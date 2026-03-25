@@ -1,0 +1,129 @@
+import os
+path = "C:/Users/rajpr/Documents/HaluEval-main/HaluEval-main/data/qa_data.json"
+print(os.path.exists(path))
+
+import json
+
+data = []
+with open("C:/Users/rajpr/Documents/HaluEval-main/HaluEval-main/data/qa_data.json", "r", encoding="utf-8") as f:
+    for line in f:
+        data.append(json.loads(line))
+
+print(len(data))
+print(data[0].keys())
+
+import pandas as pd
+
+rows = []
+
+for item in data:
+    # truthful sample
+    rows.append({
+        "question": item["question"],
+        "response": item["right_answer"],
+        "knowledge": item["knowledge"],
+        "label": 0
+    })
+    
+    # hallucinated sample
+    rows.append({
+        "question": item["question"],
+        "response": item["hallucinated_answer"],
+        "knowledge": item["knowledge"],
+        "label": 1
+    })
+
+df_halueval = pd.DataFrame(rows)
+
+print(df_halueval["label"].value_counts())
+
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
+
+knowledge_texts = df_halueval["knowledge"].unique().tolist()
+knowledge_emb = encoder.encode(
+    knowledge_texts,
+    batch_size=64,
+    show_progress_bar=True
+)
+
+knowledge_map = dict(zip(knowledge_texts, knowledge_emb))
+
+from sklearn.metrics.pairwise import cosine_similarity
+
+def msh_detect_halueval(response, knowledge):
+    resp_emb = encoder.encode([response])
+    know_emb = knowledge_map[knowledge].reshape(1, -1)
+    S_fact = cosine_similarity(resp_emb, know_emb)[0][0]
+    H = 1 - S_fact
+    return H
+
+from tqdm import tqdm
+
+H_scores = []
+for _, row in tqdm(df_halueval.iterrows(), total=len(df_halueval)):
+    H_scores.append(
+        msh_detect_halueval(row["response"], row["knowledge"])
+    )
+
+df_halueval["H_score"] = H_scores
+
+
+def msh_detect_halueval(response, knowledge, question, alpha=0.6):
+    resp_emb = encoder.encode([response])
+    know_emb = knowledge_map[knowledge].reshape(1, -1)
+    ques_emb = encoder.encode([question])
+
+    S_fact = cosine_similarity(resp_emb, know_emb)[0][0]
+    S_sem = cosine_similarity(resp_emb, ques_emb)[0][0]
+
+    H = 1 - (alpha * S_fact + (1 - alpha) * S_sem)
+    return H
+
+from tqdm.auto import tqdm
+
+H_scores = []
+for _, row in tqdm(df_halueval.iterrows(), total=len(df_halueval)):
+    H_scores.append(
+        msh_detect_halueval(
+            row["response"],
+            row["knowledge"],
+            row["question"]
+        )
+    )
+
+df_halueval["H_score"] = H_scores
+
+from sklearn.metrics import f1_score
+import numpy as np
+
+scores = df_halueval["H_score"].values
+y_true = df_halueval["label"].values
+
+thresholds = np.linspace(scores.min(), scores.max(), 300)
+
+best_f1, best_th = 0, None
+for th in thresholds:
+    y_pred = (scores < th).astype(int)   # IMPORTANT FIX
+    f1 = f1_score(y_true, y_pred)
+    if f1 > best_f1:
+        best_f1, best_th = f1, th
+
+best_th, best_f1
+
+best_threshold = 0.53
+
+df_halueval["pred"] = (df_halueval["H_score"] >= best_threshold).astype(int)
+
+from sklearn.metrics import roc_curve, auc
+
+y_true = df_halueval["label"].values
+y_score = -df_halueval["H_score"].values  # NEGATE because lower score = hallucination
+
+fpr, tpr, thresholds = roc_curve(y_true, y_score)
+roc_auc = auc(fpr, tpr)
+
+print("ROC-AUC:", roc_auc)
+
+

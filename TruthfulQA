@@ -1,0 +1,131 @@
+# Required Imports
+import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.preprocessing import normalize
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# -------------------------------------
+# 1️. Load TruthfulQA dataset
+# -------------------------------------
+# Load TruthfulQA CSV (adjust path as needed)
+df = pd.read_csv(r”TruthfulQA.csv") # adjust path as needed
+print(df.columns)
+print("Total samples:", len(df))
+
+# Treat incorrect answers as hallucinated (label=1)
+# Treat correct answers as non-hallucinated (label=0)
+responses = []
+labels = []
+for _, row in df.iterrows():
+    # Correct answer → truthful
+    responses.append(row["Best Answer"])
+    labels.append(0)
+    # Incorrect answers → hallucinated
+    incorrects = str(row["Incorrect Answers"]).split(";")
+    for inc in incorrects:
+        responses.append(inc.strip())
+        labels.append(1)
+print("Total responses:", len(responses))
+print("Label distribution:")
+print("Class 0 (truthful):", labels.count(0))
+print("Class 1 (hallucinated):", labels.count(1))
+# -------------------------------
+# 2. Load encoder
+# -------------------------------
+from sentence_transformers import SentenceTransformer
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
+-----------------------------------------
+#  Define MSH-Detect scoring
+# ---------------------------------------
+# --- Semantic consistency ---
+def semantic_score(response, paraphrases=None):
+    if paraphrases is None:
+        return 1.0  # fallback
+    emb = encoder.encode([response] + paraphrases)
+    sims = cosine_similarity([emb[0]], emb[1:])
+    return float(np.mean(sims))
+# --- Factual consistency ---
+def factual_score(response, correct_answers_emb):
+    resp_emb = encoder.encode([response])
+    sims = cosine_similarity(resp_emb, correct_answers_emb)
+    return float(np.max(sims))
+# --- Final MSH-Detect ---
+def msh_detect(response, correct_answers_emb, alpha=0.5):
+    S_fact = factual_score(response, correct_answers_emb)
+# --- Hallucination Score ---
+    H = 1 - S_fact   # post-generation hallucination score
+    return H
+# Correct answer embeddings
+correct_answers_list = df["Correct Answers"].tolist()
+correct_answers_emb = encoder.encode(correct_answers_list, show_progress_bar=True)
+# -------------------------------
+# Evaluate all responses
+# -------------------------------
+H_scores = []
+for resp in responses:
+    H_scores.append(msh_detect(resp, correct_answers_emb))
+# Train – Test Split
+from sklearn.model_selection import train_test_split
+H_val, H_test, y_val, y_test = train_test_split(
+    H_scores, labels, test_size=0.3, random_state=42, stratify=labels)
+# ----------------------------------------------
+# Best Threshold, Best F1 Validation
+#-----------------------------------------------
+best_f1, best_thresh = 0, 0
+f1_scores=[]
+thresholds = np.linspace(0.05, 0.8, 80)
+for t in thresholds:
+    preds = [1 if h > t else 0 for h in H_val]
+    f1 = f1_score(y_val, preds)
+    f1_scores.append(f1)
+        if f1 > best_f1:
+        best_f1 = f1
+        best_thresh = t
+plt.figure()
+plt.plot(thresholds, f1_scores)
+plt.axvline(best_thresh, linestyle='--', label=f"Best threshold = {best_thresh:.3f}")
+plt.xlabel("Threshold")
+plt.ylabel("F1-score")
+plt.title("F1 vs Threshold - TruthfulQA")
+plt.legend()
+plt.grid(True)
+plt.show()
+print("Best threshold:", round(best_thresh, 3))
+print("Best F1-score:", round(best_f1, 4))
+# -------------------------------------------------------
+# Plot Hallucination Score Distribution
+# -------------------------------------------------------
+plt.hist([h for h,l in zip(H_scores, labels) if l==0], bins=50, alpha=0.6, label="Truthful (0)")
+plt.hist([h for h,l in zip(H_scores, labels) if l==1], bins=50, alpha=0.6, label="Hallucinated (1)")
+plt.axvline(best_thresh, linestyle="--")
+plt.grid(True)
+plt.legend()
+plt.xlabel("H_Score")
+plt.ylabel("Frequency")
+plt.title("Score Distribution - TruthfulQA")
+plt.show()
+# -------------------------------
+# Compute metrics
+# -------------------------------
+y_pred = [1 if h > best_thresh else 0 for h in H_test]
+print("Accuracy  :", accuracy_score(y_test, y_pred))
+print("Precision :", precision_score(y_test, y_pred))
+print("Recall    :", recall_score(y_test, y_pred))
+print("F1-score  :", f1_score(y_test, y_pred))
+# -------------------------------
+#  Plot ROC-AUC
+# -------------------------------
+fpr, tpr, _ = roc_curve(labels, H_scores)
+roc_auc = auc(fpr, tpr)
+plt.plot(fpr, tpr, label=f"MSH-DETECT (AUC = {roc_auc:.3f})")
+plt.plot([0,1], [0,1], linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve - TruthfulQA ")
+plt.grid(True)
+plt.legend()
+plt.show()
